@@ -1,4 +1,4 @@
-"""Kıyafete duyarlı maske (v1: sadece üst giyim + kol boyu).
+"""Kıyafete duyarlı maske (v3: üst giyim; kol boyu + bolluk + etek payı + yaka payı).
 
     maske = (eski kıyafetin alanı  ∪  yeni kıyafetin kaplayacağı alan) − korunan bölgeler
 
@@ -12,6 +12,10 @@ import numpy as np
 from .labels import ATR, DENSEPOSE, LIP, PARSE_GROUPS
 
 SLEEVES = ("long", "short", "sleeveless")
+# Bolluk -> kenar payı (piksel, 1024 yüksekliğe göre). Deney 001/002: 12 piksel
+# payla bol hırkanın kolu dirsekte kaldı, 35 pikselle bileğe indi. Model maskenin
+# şeklini kıyafetin silueti için ipucu olarak kullanıyor; bol kıyafete yer lazım.
+FIT_GROW = {"tight": 12, "normal": 24, "loose": 36}
 
 
 class ParseMaps:
@@ -76,6 +80,14 @@ def erode(mask, px):
     return cv2.erode(mask.astype(np.uint8), _kernel(px)) > 0
 
 
+def extend_down(mask, px):
+    """Maskeyi sadece AŞAĞI doğru px piksel uzatır (etek payı için)."""
+    if px <= 0:
+        return mask.copy()
+    kernel = np.ones((int(px) + 1, 1), np.uint8)
+    return cv2.dilate(mask.astype(np.uint8), kernel, anchor=(0, int(px))) > 0
+
+
 def open_thin(mask, px):
     """px'ten ince şeritleri ve çıkıntıları siler, ana şekli korur."""
     if px <= 0:
@@ -83,30 +95,67 @@ def open_thin(mask, px):
     return cv2.morphologyEx(mask.astype(np.uint8), cv2.MORPH_OPEN, _kernel(px)) > 0
 
 
-def protect_area(maps, old, scale=1.0, hem_px=6):
+def split_head(maps, neck=0.6):
+    """Başı 'korunacak kısım' ve 'serbest boyun' olarak ikiye ayırır.
+
+    DensePose 'baş' bölgesi boynu da içerir. Boynun tamamı korunursa yakalı
+    kıyafetin yakası sıkışıp bozuluyor (deney 005). Bu yüzden boynun alt kısmı
+    maskeye açılır:  neck=0 -> boyun tamamen korunur, neck=1 -> çeneye kadar açılır.
+    Döndürür: (korunan_bas, serbest_boyun)
+    """
+    dp_head = maps.body("face")
+    lip_face = maps.lip == LIP["face"]
+    free = np.zeros(maps.shape, dtype=bool)
+    if neck > 0 and lip_face.any() and dp_head.any():
+        chin = np.nonzero(lip_face.any(axis=1))[0].max()       # LIP yüzü çenede biter
+        bottom = np.nonzero(dp_head.any(axis=1))[0].max()      # boynun en alt satırı
+        if bottom > chin:
+            cut = int(round(bottom - neck * (bottom - chin)))
+            below = np.arange(maps.shape[0])[:, None] > cut
+            free = dp_head & below & ~lip_face
+    return (dp_head & ~free) | lip_face, free
+
+
+def protect_area(maps, old, scale=1.0, overlap_px=6, hem_zone=None, neck=0.6):
     """Hiçbir koşulda maskeye girmeyecek bölgeler.
 
     old: eski kıyafetin alanı. Bir piksele bir ayrıştırıcı 'üst giysi', diğeri
     'pantolon' derse üst giysi kazanır (yoksa etek ucu maskesiz kalır).
+    hem_zone: yeni kıyafetin eteğinin sarkacağı alan; pantolon koruması buradan kalkar.
     """
     b, p = maps.body, maps.parse
-    # Baş çekirdeği: DensePose başı + LIP yüzü (ikisi de dar ve güvenilir).
-    core = b("face") | (maps.lip == LIP["face"])
-    # ATR 'yüz' etiketi omuzlara ve yakaya taşabiliyor. Onu sadece başın
-    # hemen yanında (kulak gibi), gövdenin ve eski kıyafetin dışında sayıyoruz.
+    # Baş çekirdeği: DensePose başı (serbest boyun hariç) + LIP yüzü.
+    core, free_neck = split_head(maps, neck)
+    # ATR 'yüz' etiketi omuzlara ve yakaya taşabiliyor. Onu sadece başın hemen
+    # yanında (kulak gibi), gövdenin, eski kıyafetin ve serbest boynun dışında sayıyoruz.
     atr_face = maps.atr == ATR["face"]
-    head = core | (atr_face & dilate(core, round(15 * scale)) & ~b("torso") & ~old)
-    # Alt giyim: eski üstle çakışan pikseller hariç, kenardan hem_px içeri çekilmiş.
+    near = dilate(core, round(15 * scale)) & ~dilate(free_neck, round(15 * scale))
+    head = core | (atr_face & near & ~b("torso") & ~old)
+    # Alt giyim: eski üstle çakışan pikseller hariç, kenardan biraz içeri çekilmiş.
     # Böylece yeni kıyafetin eteği bel çizgisinin biraz üstüne binebilir.
-    lower = erode((p("pants") | p("skirt")) & ~old, round(hem_px * scale))
+    lower = erode((p("pants") | p("skirt")) & ~old, round(overlap_px * scale))
+    if hem_zone is not None:
+        lower = lower & ~hem_zone
     return (head | p("hair") | p("hat") | p("sunglasses")
             | b("hands") | p("glove") | b("feet") | p("shoes") | p("bag") | lower)
 
 
-def build_upper_mask(maps, sleeve="long", grow_px=12):
-    """Üst giyim maskesi. Döndürür: {'mask': uint8 0/255, 'old', 'new', 'protect'}"""
+def build_upper_mask(maps, sleeve="long", fit="normal", hem_px=0, neck=0.6, grow_px=None):
+    """Üst giyim maskesi.
+
+    sleeve : yeni kıyafetin kolu      -> long | short | sleeveless
+    fit    : yeni kıyafetin bolluğu   -> tight | normal | loose  (kenar payını belirler)
+    hem_px : etek payı; yeni kıyafet eskisinden ne kadar aşağı sarkabilir (piksel)
+    neck   : boynun ne kadarı yakaya açılsın (0 = hiç, 1 = çeneye kadar)
+    grow_px: verilirse fit'in kenar payını ezer (deney için)
+    Döndürür: {'mask': uint8 0/255, 'old', 'new', 'protect'}
+    """
     if sleeve not in SLEEVES:
         raise ValueError(f"sleeve {SLEEVES} içinden olmalı")
+    if fit not in FIT_GROW:
+        raise ValueError(f"fit {tuple(FIT_GROW)} içinden olmalı")
+    if grow_px is None:
+        grow_px = FIT_GROW[fit]
     scale = maps.shape[0] / 1024.0              # piksel ayarları 1024 yüksekliğe göre
     b, p = maps.body, maps.parse
 
@@ -120,8 +169,28 @@ def build_upper_mask(maps, sleeve="long", grow_px=12):
     if sleeve == "long":
         new = new | b("forearms")
 
+    # 2b) Etek payı: eski kıyafetin gövde kısmını aşağı doğru uzat.
+    #     Kollar hariç tutulur, yoksa uzantı ellerin yanına iner.
+    hem_zone = None
+    if hem_px > 0:
+        arms = b("big_arms") | b("forearms") | b("hands")
+        lower_clothes = p("pants") | p("skirt")
+        body_part = (old & ~arms) if old.any() else (b("torso") & ~lower_clothes)
+        hem_zone = extend_down(body_part, round(hem_px * scale))
+        new = new | hem_zone
+
+    # 2c) Yaka payı: boynun alt kısmı yeni kıyafetin yakasına açılır
+    new = new | split_head(maps, neck)[1]
+
     # 3) Korunan bölgeler
-    protect = protect_area(maps, old, scale)
+    protect = protect_area(maps, old, scale, hem_zone=hem_zone, neck=neck)
+    # 3b) Yeni kıyafetin örtmeyeceği çıplak kol korunur. Sadece "dahil etmemek"
+    #     yetmiyor: kenar payı gövdeden kolun iç yüzüne taşıp teni bozuyor (deney 006).
+    #     Eski kıyafetin kumaşı varsa (uzun koldan kısaya geçiş) orası yine silinir.
+    if sleeve == "short":
+        protect = protect | (b("forearms") & ~old)
+    elif sleeve == "sleeveless":
+        protect = protect | ((b("big_arms") | b("forearms")) & ~old)
 
     # 4) Birleştir, temizle, kenar payı ekle, korunanları çıkar
     mask = old | new
