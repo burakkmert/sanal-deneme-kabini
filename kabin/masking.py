@@ -126,6 +126,9 @@ def protect_area(maps, old, scale=1.0, overlap_px=6, hem_zone=None, neck=0.6):
     b, p = maps.body, maps.parse
     # Baş çekirdeği: DensePose başı (serbest boyun hariç) + LIP yüzü.
     core, free_neck = split_head(maps, neck)
+    # Boğazlı kazak gibi boynu örten eski kıyafet korunmaz, yoksa çenenin altında
+    # eski kumaştan bir şerit kalır. LIP'in "yüz" dediği yer her durumda korunur.
+    core = (core & ~old) | (maps.lip == LIP["face"])
     # ATR 'yüz' etiketi omuzlara ve yakaya taşabiliyor. Onu sadece başın hemen
     # yanında (kulak gibi), gövdenin, eski kıyafetin ve serbest boynun dışında sayıyoruz.
     atr_face = maps.atr == ATR["face"]
@@ -136,8 +139,12 @@ def protect_area(maps, old, scale=1.0, overlap_px=6, hem_zone=None, neck=0.6):
     lower = erode((p("pants") | p("skirt")) & ~old, round(overlap_px * scale))
     if hem_zone is not None:
         lower = lower & ~hem_zone
+    # Eller: DensePose "el" bölgesi bileği ve manşeti de kapsayabiliyor. Eski kıyafetin
+    # kumaşı el korumasına girerse yeni kıyafetin altında kalıyor (deney 008: siyah
+    # manşetler, deney 010: pembe gömlek parçaları). Kumaş olan piksel el sayılmaz.
+    hands = b("hands") & ~old
     return (head | p("hair") | p("hat") | p("sunglasses")
-            | b("hands") | p("glove") | b("feet") | p("shoes") | p("bag") | lower)
+            | hands | p("glove") | b("feet") | p("shoes") | p("bag") | lower)
 
 
 def build_upper_mask(maps, sleeve="long", fit="normal", hem_px=0, neck=0.6, grow_px=None):
@@ -202,3 +209,84 @@ def build_upper_mask(maps, sleeve="long", fit="normal", hem_px=0, neck=0.6, grow
     mask = remove_small(mask)
 
     return {"mask": mask.astype(np.uint8) * 255, "old": old, "new": new, "protect": protect}
+
+
+# ---------------------------------------------------------------------------
+# Melez maske: orijinal AutoMasker maskesi + kıyafete göre düzeltmeler
+# ---------------------------------------------------------------------------
+# build_upper_mask (yukarıda) maskeyi sıfırdan kuruyordu. Kolay fotoğrafta iyi
+# çalıştı ama segmentasyon hata yaptığında (boğazlı kazak, manşet, el çevresi)
+# eski kıyafetin parçaları yerinde kaldı (deney 008-010). Orijinal maske "emin
+# olmadığın her yeri maskele" dediği için bu hatalara dayanıklı. Bu yüzden onu
+# temel alıp yalnızca deneyde işe yaradığını gördüğümüz düzeltmeleri ekliyoruz.
+
+def bare_ratio(maps, part, old):
+    """Vücut bölgesinin ne kadarı çıplak ten (0-1). Bölge görünmüyorsa 0."""
+    region = maps.body(part)
+    if not region.any():
+        return 0.0
+    bare = region & maps.parse("arms_skin") & ~old
+    return float(bare.sum() / region.sum())
+
+
+def build_hybrid_mask(baseline, maps, sleeve="long", hem_px=0, bare_min=0.8):
+    """Orijinal maskeyi kıyafete göre düzeltir.
+
+    baseline: AutoMasker'ın 'upper' maskesi (PIL ya da dizi)
+    Düzeltmeler:
+      1) Etek payı: yeni kıyafet eskisinden uzunsa maske aşağı uzatılır.
+      2) Çıplak kol koruması: yeni kıyafet kolu örtmeyecekse VE kol zaten
+         çıplaksa (bare_min oranında) kişinin kendi kolu korunur. Kol kumaşla
+         kaplıysa dokunulmaz; orijinal maske gibi tamamı modele bırakılır.
+      3) Kopuk küçük lekeler (kulaktaki nokta gibi) silinir.
+    Döndürür: {'mask': uint8 0/255, 'notes': [uygulanan düzeltmeler]}
+    """
+    if sleeve not in SLEEVES:
+        raise ValueError(f"sleeve {SLEEVES} içinden olmalı")
+    mask = np.array(baseline.convert("L") if hasattr(baseline, "convert") else baseline) > 127
+    if mask.shape != maps.shape:
+        raise ValueError("Maske ve harita boyutları farklı")
+    scale = maps.shape[0] / 1024.0
+    b, p = maps.body, maps.parse
+    old = p("upper_clothes") | p("coat")
+    hands = b("hands") & ~old
+    notes = []
+
+    # 1) Etek payı
+    keep = old | b("torso")
+    if hem_px > 0:
+        arms = b("big_arms") | b("forearms") | b("hands")
+        lower = p("pants") | p("skirt")
+        body_part = (old & ~arms) if (old & ~arms).any() else (b("torso") & ~lower)
+        # Kadrajda alt giyimden az yer kaldıysa etek payı kısılır. Maske kadrajın
+        # dibine kadar inerse model pantolonun rengini göremez ve uydurur (deney 2:
+        # bej pantolon siyaha döndü). Görünen alt giyimin en fazla üçte biri kapatılır.
+        hem = round(hem_px * scale)
+        if body_part.any() and lower.any():
+            room = int(np.nonzero(lower.any(axis=1))[0].max()) - int(np.nonzero(body_part.any(axis=1))[0].max())
+            hem = max(0, min(hem, room // 3))
+        hem_zone = extend_down(body_part, hem) & ~hands & ~p("shoes")
+        mask = mask | hem_zone
+        keep = keep | hem_zone
+        notes.append(f"etek payı {hem}px" + ("" if hem == round(hem_px * scale) else f" (istenen {hem_px}, kadraj dar)"))
+
+    # 2) Çıplak kol koruması (sadece güvenliyken)
+    parts = {"long": [], "short": ["forearms"], "sleeveless": ["big_arms", "forearms"]}[sleeve]
+    if parts and all(bare_ratio(maps, part, old) >= bare_min for part in parts):
+        arm = np.zeros(maps.shape, dtype=bool)
+        for part in parts:
+            arm |= b(part)
+        arm = (arm | hands) & ~old
+        if sleeve == "short":
+            keep = keep | b("big_arms")
+        # Kolun çevresindeki maske halkasını da kaldır, ama gövde tarafına dokunma
+        remove = dilate(arm, round(30 * scale)) & ~dilate(keep, round(20 * scale))
+        mask = mask & ~(remove | arm)
+        mask = open_thin(mask, round(8 * scale))
+        notes.append("çıplak kol korundu: " + ", ".join(parts))
+    elif parts:
+        notes.append("kol kumaşla kaplı: orijinal maske korundu")
+
+    # 3) Kopuk lekeler
+    mask = remove_small(mask, 0.002)
+    return {"mask": mask.astype(np.uint8) * 255, "notes": notes}

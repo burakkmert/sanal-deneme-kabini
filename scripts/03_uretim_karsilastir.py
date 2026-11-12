@@ -4,7 +4,7 @@ Kullanım:
   python scripts/03_uretim_karsilastir.py --kisi KISI_FOTO --kiyafet KIYAFET_FOTO 
 Ayar verilmezse kol, bolluk ve etek payı kıyafet fotoğrafından tahmin edilir.
 Elle vermek için: --kol long --bolluk bol --etek 40
-Çıktı: outputs/03_uretim/NNN_<kisi>_<kol>_<bolluk>_etek<N>/karsilastirma.png + tek tek görseller + ayarlar.json
+Çıktı: outputs/03_uretim/NNN_<kisi>_<yontem>_<kol>_etek<N>/karsilastirma.png + tek tek görseller + ayarlar.json
 """
 import argparse
 import json
@@ -19,7 +19,7 @@ sys.path.insert(0, str(ROOT))   # 'kabin' paketini bulabilmek için
 
 from kabin.catvton import Motor  # noqa: E402
 from kabin.kayit import numarali_klasor  # noqa: E402
-from kabin.masking import build_upper_mask  # noqa: E402
+from kabin.masking import build_hybrid_mask, build_upper_mask  # noqa: E402
 
 
 def boya(kisi, maske, renk):
@@ -52,6 +52,8 @@ def main():
                     help="YENİ kıyafetin bolluğu (verilmezse tahmin edilir)")
     ap.add_argument("--etek", type=int, default=None,
                     help="etek payı (piksel); verilmezse kıyafetin boyundan tahmin edilir")
+    ap.add_argument("--yontem", default="melez", choices=["melez", "sifirdan"],
+                    help="melez: orijinal maske + düzeltmeler (varsayılan); sifirdan: ilk yaklaşım")
     ap.add_argument("--boyun", type=float, default=0.6,
                     help="boynun ne kadarı yakaya açılsın: 0 = hiç, 1 = çeneye kadar")
     ap.add_argument("--grow_px", type=int, default=None, help="kenar payını elle ver (deney için)")
@@ -77,12 +79,17 @@ def main():
     kisi, kiyafet = motor.hazirla(Image.open(args.kisi), Image.open(args.kiyafet))
 
     orijinal, haritalar = motor.maskele(kisi, "upper")
-    fit = {"dar": "tight", "normal": "normal", "bol": "loose"}[args.bolluk]
-    akilli = Image.fromarray(build_upper_mask(
-        haritalar, sleeve=args.kol, fit=fit, hem_px=args.etek, neck=args.boyun, grow_px=args.grow_px)["mask"])
+    if args.yontem == "melez":
+        sonuc_maske = build_hybrid_mask(orijinal, haritalar, sleeve=args.kol, hem_px=args.etek)
+        print("Melez maske düzeltmeleri:", "; ".join(sonuc_maske["notes"]) or "yok")
+    else:
+        fit = {"dar": "tight", "normal": "normal", "bol": "loose"}[args.bolluk]
+        sonuc_maske = build_upper_mask(haritalar, sleeve=args.kol, fit=fit, hem_px=args.etek,
+                                       neck=args.boyun, grow_px=args.grow_px)
+    akilli = Image.fromarray(sonuc_maske["mask"])
     maskeler = {"orijinal": motor.yumusat(orijinal), "akilli": motor.yumusat(akilli)}
 
-    klasor = numarali_klasor(ROOT / "outputs" / "03_uretim", f"{Path(args.kisi).stem}_{args.kol}_{args.bolluk}_etek{args.etek}")
+    klasor = numarali_klasor(ROOT / "outputs" / "03_uretim", f"{Path(args.kisi).stem}_{args.yontem}_{args.kol}_etek{args.etek}")
     kisi.save(klasor / "kisi.png")
     kiyafet.save(klasor / "kiyafet.png")
 
@@ -102,7 +109,8 @@ def main():
 
     ayarlar = {"kisi": str(args.kisi), "kiyafet": str(args.kiyafet), "kol": args.kol,
                "bolluk": args.bolluk, "etek": args.etek,
-               "otomatik": tahmin is not None, "boyun": args.boyun, "grow_px": args.grow_px,
+               "otomatik": tahmin is not None, "yontem": args.yontem,
+               "duzeltmeler": sonuc_maske.get("notes", []), "boyun": args.boyun, "grow_px": args.grow_px,
                "adim": args.adim, "cfg": args.cfg, "seed": args.seed,
                "sonuc": bilgiler}
     (klasor / "ayarlar.json").write_text(json.dumps(ayarlar, indent=2, ensure_ascii=False), encoding="utf-8")
